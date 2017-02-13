@@ -10,6 +10,7 @@ use File::Spec::Functions qw(catdir);
 
 use Net::AMQP;
 use Net::AMQP::Common qw(:all);
+use bytes;
 
 use Mojo::RabbitMQ::Channel;
 use Mojo::RabbitMQ::LocalQueue;
@@ -135,16 +136,18 @@ sub _handle {
 
 sub _read {
   my ($self, $id, $chunk) = @_;
-  my $chunk_len = length($chunk);
+  $self->{id} = $id;
+  $self->{chunk} = $chunk;
+  my $chunk_len = bytes::length($chunk);
 
-  if ($chunk_len + length($self->{buffer}) > $self->max_buffer_size) {
+  if ($chunk_len + bytes::length($self->{buffer}) > $self->max_buffer_size) {
     $self->{buffer} = '';
     return;
   }
 
   my $data = $self->{buffer} .= $chunk;
 
-  if (length($data) < 8) {
+  if (bytes::length($data) < 8) {
     return;
   }
 
@@ -154,7 +157,7 @@ sub _read {
     return;
   }
 
-  if (length($data) < $length) {
+  if (bytes::length($data) < $length) {
     return;
   }
 
@@ -167,45 +170,48 @@ sub _read {
 sub _parse_frames {
   my $self = shift;
   my $data = $self->{buffer};
+  my $frame_is_complete = 0;
 
   my ($type_id, $channel, $length,) = unpack 'CnN', substr $data, 0, 7;
 
-  my $stack = substr $self->{buffer}, 0, $length + 8, '';
+  if (bytes::length($data) >= $length) {
+	  $frame_is_complete = 1;
+	  my $stack = substr $self->{buffer}, 0, $length + 8, '';
+	  my ($frame) = Net::AMQP->parse_raw_frames(\$stack);
 
-  my ($frame) = Net::AMQP->parse_raw_frames(\$stack);
+	  if ($frame->isa('Net::AMQP::Frame::Heartbeat')) {
+		$self->heartbeat_received(time());
+	  }
+	  elsif ($frame->isa('Net::AMQP::Frame::Method')
+		and $frame->method_frame->isa('Net::AMQP::Protocol::Connection::Close'))
+	  {
+		$self->is_open(0);
 
-  if ($frame->isa('Net::AMQP::Frame::Heartbeat')) {
-    $self->heartbeat_received(time());
-  }
-  elsif ($frame->isa('Net::AMQP::Frame::Method')
-    and $frame->method_frame->isa('Net::AMQP::Protocol::Connection::Close'))
-  {
-    $self->is_open(0);
-
-    $self->_write_frame(Net::AMQP::Protocol::Connection::CloseOk->new());
-    $self->emit(disconnect => "Server side disconnection: "
-        . $frame->method_frame->{reply_text});
-  }
-  elsif ($frame->channel == 0) {
-    $self->queue->push($frame);
-  }
-  else {
-    my $channel = $self->channels->{$frame->channel};
-    if (defined $channel) {
-      $channel->_push_queue_or_consume($frame);
-    }
-    else {
-      $self->emit(
-        error => "Unknown channel id received: "
-          . ($frame->channel // '(undef)'),
-        $frame
-      );
-    }
+		$self->_write_frame(Net::AMQP::Protocol::Connection::CloseOk->new());
+		$self->emit(disconnect => "Server side disconnection: "
+			. $frame->method_frame->{reply_text});
+	  }
+	  elsif ($frame->channel == 0) {
+		$self->queue->push($frame);
+	  }
+	  else {
+		my $channel = $self->channels->{$frame->channel};
+		if (defined $channel) {
+		  $channel->_push_queue_or_consume($frame);
+		}
+		else {
+		  $self->emit(
+			error => "Unknown channel id received: "
+			  . ($frame->channel // '(undef)'),
+			$frame
+		  );
+		}
+	}
   }
 
   weaken $self;
   $self->_loop->next_tick(sub { $self->_parse_frames })
-    if length($self->{buffer}) >= 8;
+	if (bytes::length($self->{buffer}) >= 8 && $frame_is_complete);
 }
 
 sub _connect {
@@ -243,7 +249,9 @@ sub _connect {
       $stream->on(timeout => sub { $self->_error($id, 'Inactivity timeout') });
       $stream->on(close => sub { $self->_handle($id, 1) });
       $stream->on(error => sub { $self && $self->_error($id, pop) });
-      $stream->on(read => sub { $self->_read($id, pop) });
+      $stream->on(read => sub {
+		$self->_read($id, pop)
+	  });
       $cb->();
     }
   );

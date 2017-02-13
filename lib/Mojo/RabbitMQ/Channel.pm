@@ -425,7 +425,31 @@ sub _push_read_header_and_body {
   my ($type, $frame, $cb, $failure_cb) = @_;
   my $response = {$type => $frame};
   my $body_size = 0;
+  my $body_payload = "";
+  my $wcontq = $self->content_queue
+  weaken $wcontq;
+  my $w_body_frame;
+  my $body_frame = sub {
+    my $frame = shift;
 
+    return $failure_cb->('Received data is not body frame')
+        if !$frame->isa('Net::AMQP::Frame::Body');
+
+    $body_payload .= $frame->payload;
+
+    if (length($body_payload) < $body_size) {
+      # More to come
+      my $contq = $wcontq or return;
+      $contq->get($w_body_frame);
+    }
+    else {
+      $frame->payload($body_payload);
+      $response->{body} = $frame;
+      $cb->($response);
+    }
+  };
+  $w_body_frame = $body_frame;
+  weaken $w_body_frame;
   $self->content_queue->get(
     sub {
       my $frame = shift;
@@ -441,32 +465,15 @@ sub _push_read_header_and_body {
 
       $response->{header} = $header_frame;
       $body_size = $frame->body_size;
+      if ( $body_size ) {
+        my $contq = $wcontq or return;
+        $contq->get($body_frame);
+      } else {
+        $response->{body} = undef;
+        $cb->($response);
+      }
     }
   );
-
-  my $body_payload = "";
-  my $next_frame;
-  $next_frame = sub {
-    my $frame = shift;
-
-    return $failure_cb->('Received data is not body frame')
-      if !$frame->isa('Net::AMQP::Frame::Body');
-
-    $body_payload .= $frame->payload;
-
-    if (length($body_payload) < $body_size) {
-
-      # More to come
-      $self->content_queue->get($next_frame);
-    }
-    else {
-      $frame->payload($body_payload);
-      $response->{body} = $frame;
-      $cb->($response);
-    }
-  };
-
-  $self->content_queue->get($next_frame);
 
   return $self;
 }
